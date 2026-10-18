@@ -106,6 +106,29 @@ const schema = z.object({
   // If not set, derived from API_PUBLIC_URL so the deployed domain is used automatically.
   SEP10_HOME_DOMAIN: z.string().optional(),
   WEB_AUTH_DOMAIN: z.string().optional(),
+  /**
+   * How long a freshly issued SEP-10 challenge stays redeemable, in seconds.
+   *
+   * Bounded on both ends because this one number is a security parameter and an
+   * ergonomic one at the same time. A long window widens the replay surface —
+   * the durable store must hold every issued challenge until the envelope's own
+   * `maxTime` plus skew has passed, and a challenge an attacker lifted is
+   * signable the whole time — while a short one breaks the honest clients: a
+   * hardware wallet or a slow mobile signer can take tens of seconds between
+   * showing the envelope and returning it. SEP-10 itself recommends ~5 minutes,
+   * so that is the default and the range only permits tightening or loosening
+   * it by a bounded amount rather than an unbounded one.
+   *
+   * A typo like `3600` would otherwise be accepted as a valid number and
+   * silently turn logins into hour-long credentials; rejecting it at boot makes
+   * the mistake an operator sees.
+   */
+  SEP10_CHALLENGE_VALIDITY_SECONDS: z.coerce
+    .number()
+    .int("SEP10_CHALLENGE_VALIDITY_SECONDS must be a whole number of seconds")
+    .min(30, "SEP10_CHALLENGE_VALIDITY_SECONDS must be at least 30 seconds")
+    .max(600, "SEP10_CHALLENGE_VALIDITY_SECONDS must be at most 600 seconds")
+    .default(300),
   
   // Anchor configuration
   ANCHOR_HOME_DOMAIN: z.string().min(1, "ANCHOR_HOME_DOMAIN is required"),

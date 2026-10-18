@@ -186,6 +186,47 @@ describe("env schema — numeric constraints", () => {
   it("rejects ACCESS_TOKEN_TTL_SECONDS above 86400", () => {
     expect(() => envSchema.parse({ ...validEnv, ACCESS_TOKEN_TTL_SECONDS: "86401" })).toThrow();
   });
+
+  // SEP-10 challenge lifetime (#659). Bounded on both ends: the top of the
+  // range is the replay window a stolen envelope stays signable, the bottom is
+  // how long a slow signer (hardware wallet, mobile) gets to return it.
+  it.each(["30", "300", "600"])(
+    "accepts a SEP10_CHALLENGE_VALIDITY_SECONDS of %s",
+    (value) => {
+      expect(
+        envSchema.parse({ ...validEnv, SEP10_CHALLENGE_VALIDITY_SECONDS: value })
+          .SEP10_CHALLENGE_VALIDITY_SECONDS
+      ).toBe(Number(value));
+    }
+  );
+
+  it("defaults the SEP-10 challenge lifetime to SEP-10's recommendation", () => {
+    expect(envSchema.parse(validEnv).SEP10_CHALLENGE_VALIDITY_SECONDS).toBe(300);
+  });
+
+  it.each([
+    ["29, below the signing floor", "29"],
+    ["601, past the replay bound", "601"],
+    ["3600, the hour-long typo this guards against", "3600"],
+    ["a fractional second", "30.5"],
+    ["a non-number", "five-minutes"],
+    ["negative", "-300"],
+  ])("rejects SEP10_CHALLENGE_VALIDITY_SECONDS of %s", (_label, value) => {
+    expect(() =>
+      envSchema.parse({ ...validEnv, SEP10_CHALLENGE_VALIDITY_SECONDS: value })
+    ).toThrow();
+  });
+
+  it("names the field when the SEP-10 lifetime is out of bounds", () => {
+    const result = envSchema.safeParse({
+      ...validEnv,
+      SEP10_CHALLENGE_VALIDITY_SECONDS: "3600",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(safeErrorMessage(result.error)).toContain("SEP10_CHALLENGE_VALIDITY_SECONDS");
+    }
+  });
 });
 
 describe("env schema — error reporting", () => {

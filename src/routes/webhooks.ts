@@ -303,6 +303,7 @@ async function webhookManagementRoutes(app: FastifyInstance) {
   });
 
   app.delete("/groups/:groupId/webhooks/:webhookId", asAdmin, async (req) => {
+    const auth = requireUser(req);
     const { groupId, webhookId } = webhookParamsSchema.parse(req.params);
 
     const webhook = await (prisma as any).webhook.findFirst({
@@ -311,6 +312,19 @@ async function webhookManagementRoutes(app: FastifyInstance) {
     if (!webhook) throw Errors.notFound("Webhook not found");
 
     await (prisma as any).webhook.delete({ where: { id: webhookId } });
+
+    // The URL and event list are recorded because the row itself is gone:
+    // without them the trail says a webhook existed but not which endpoint
+    // stopped receiving the group's events.
+    await audit({
+      userId: auth.id,
+      groupId,
+      action: "webhook.deregister",
+      entityType: "webhook",
+      entityId: webhookId,
+      metadata: { url: webhook.url, events: webhook.events },
+    });
+
     return { deleted: true };
   });
 

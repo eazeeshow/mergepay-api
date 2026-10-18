@@ -190,6 +190,7 @@ See [.env.example](.env.example). Key ones:
 | `STELLAR_NETWORK` | `testnet` or `public` |
 | `HORIZON_URL` | Horizon server |
 | `SEP10_SIGNING_SECRET` | Server's SEP-10 signing key (`npm run gen:sep10key`) |
+| `SEP10_CHALLENGE_VALIDITY_SECONDS` | How long an issued SEP-10 challenge stays redeemable (default: 300, allowed 30–600) |
 | `WEB_URL` | Frontend origin allow-list for CORS + invite links (comma-separated; `*` for local dev) |
 | `ANCHOR_HOME_DOMAIN` | SEP-24 anchor home domain (default SDF test anchor) |
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
@@ -741,16 +742,45 @@ unknown keys rather than silently ignoring them:
   public key with checksum refinement
   ([`src/validations/sep10.ts`](src/validations/sep10.ts:28-39))
 - **`POST /auth/verify`**: validates `transaction` as canonical base64 XDR
-  (whole number of 4-byte words, max 50KB), optional `home_domain` and
-  `client_domain` as valid domains
-  ([`src/validations/sep10.ts`](src/validations/sep10.ts:108-125))
+  (whole number of 4-byte words, max 50KB), and `home_domain` / `client_domain`
+  as valid domains when they are present
+  ([`src/validations/sep10.ts`](src/validations/sep10.ts:168-176))
 
 Unknown query parameters are also rejected, so a client mistakenly sending
 `GET /auth?account=...` gets a 400 VALIDATION_ERROR instead of being silently
 ignored.
 
+**Domain claims (#659)** — the schema's question is shape; what the server does
+with those two values is decided by the route, before any envelope is parsed and
+before this server's challenge is consumed:
+
+- `client_domain`, and the legacy `clientDomain` spelling, → **400
+  CLIENT_DOMAIN_UNSUPPORTED**. This server performs no client-domain
+  verification ([`src/services/sep10.ts`](src/services/sep10.ts) refuses a
+  challenge envelope carrying that operation), so accepting the field and
+  dropping it left a wallet integration believing it had one.
+- a `home_domain` other than the one challenges are issued for (`SEP10_HOME_DOMAIN`,
+  compared case-insensitively) → **400 HOME_DOMAIN_MISMATCH**, naming the
+  expected domain.
+
+Both answer a question about the *request*, not the credential, so they add no
+way to probe how a signature check failed. Neither burns the challenge: a
+corrected retry of the same signed envelope still works.
+
+**Challenge lifetime.** `SEP10_CHALLENGE_VALIDITY_SECONDS` (default 300,
+accepted 30–600, bounded in [`src/config.ts`](src/config.ts)) is a single value
+shared by challenge generation and the redemption bounds check, so the two can
+never disagree about how long an envelope stays redeemable.
+
+**Store outages.** When the durable single-use store cannot be reached,
+verification fails closed with **503 SERVICE_UNAVAILABLE** instead of a 401:
+still no session, but the client is told to retry and an incident shows up as an
+unavailable dependency rather than as a wave of bad credentials. The database's
+own error text is never returned.
+
 Tests: [`tests/validations/sep10.test.ts`](tests/validations/sep10.test.ts),
-[`tests/sep10-request-validation.test.ts`](tests/sep10-request-validation.test.ts).
+[`tests/sep10-request-validation.test.ts`](tests/sep10-request-validation.test.ts),
+[`tests/sep10-generation-and-redemption.test.ts`](tests/sep10-generation-and-redemption.test.ts).
 
 ## Deployment
 

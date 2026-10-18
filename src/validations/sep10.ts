@@ -151,8 +151,15 @@ const transactionXdrSchema = z
  * (src/services/sep10.ts), which is the single authority on whether this is a
  * challenge this server issued.
  *
- * Optional SEP-10 `home_domain` and `client_domain` values are format-checked.
- * The legacy `clientDomain` spelling remains accepted for existing clients.
+ * Optional SEP-10 `home_domain` and `client_domain` values are format-checked
+ * here because their *shape* is this layer's question. What the server does
+ * with them is decided by the route (src/routes/auth.ts) before any envelope is
+ * touched: `client_domain` is rejected outright, since this server performs no
+ * client-domain verification, and a `home_domain` that is not the domain the
+ * challenges are issued for is rejected as a mismatch. The legacy `clientDomain`
+ * spelling remains accepted as a key so that the response a such a client gets
+ * is that explicit "not supported" error rather than a confusing "unknown
+ * field" one.
  * Any other key is rejected.
  *
  * Re-exported from `src/schemas/auth.ts`, the import point this endpoint's

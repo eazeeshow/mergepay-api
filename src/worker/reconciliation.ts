@@ -15,6 +15,8 @@ type ReconciliationRecord = {
   stellarTxHash: string | null;
   updatedAt: Date;
   createdAt?: Date;
+  /** Present for `settlement` and `treasuryProposal`; `withdrawal` has no group. */
+  groupId?: string;
   expenseShareId?: string | null;
   retryCount?: number;
   ledger?: number | null;
@@ -184,6 +186,7 @@ async function writeStatus(
 
   await audit({
     userId: null,
+    groupId: record.groupId,
     actorType: "worker",
     action: `stellar_transaction_${status}`,
     entityType: table,

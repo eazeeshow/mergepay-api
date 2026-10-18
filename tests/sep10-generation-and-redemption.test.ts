@@ -60,6 +60,11 @@ import { CLOCK_SKEW_TOLERANCE_SECONDS } from "../src/lib/time-bounds";
 
 const T0 = new Date("2026-09-29T12:00:00.000Z");
 const UNAUTHORIZED = { status: 401, code: "UNAUTHORIZED" };
+/**
+ * An unreachable challenge store is the server's failure, not a rejected
+ * credential. Verification still fails closed; only the reporting changes.
+ */
+const STORE_UNAVAILABLE = { status: 503, code: "SERVICE_UNAVAILABLE" };
 const UNFUNDED = {
   exists: false,
   sequence: "0",
@@ -161,6 +166,59 @@ describe("SEP-10 challenge generation — the signing key", () => {
     vi.resetModules();
     const second = (await import("../src/services/sep10")).serverKeypair();
     expect(second.publicKey()).not.toBe(first.publicKey());
+  });
+});
+
+describe("SEP-10 challenge validity window comes from the deployment", () => {
+  /**
+   * Re-import the service with a configured lifetime. `CHALLENGE_VALIDITY_SECONDS`
+   * is read once at module load, so the only way to observe a non-default TTL is
+   * a fresh module instance — the same one then both builds and checks.
+   */
+  async function serviceWithValidity(seconds: string) {
+    vi.resetModules();
+    vi.stubEnv("SEP10_CHALLENGE_VALIDITY_SECONDS", seconds);
+    return import("../src/services/sep10");
+  }
+
+  it("stamps the configured lifetime into the envelope's bounds", async () => {
+    const sep10 = await serviceWithValidity("60");
+    const client = Keypair.random();
+
+    expect(sep10.CHALLENGE_VALIDITY_SECONDS).toBe(60);
+
+    const { transaction, networkPassphrase } = sep10.buildChallenge(client.publicKey());
+    const bounds = new Transaction(transaction, networkPassphrase).timeBounds!;
+    expect(Number(bounds.maxTime) - Number(bounds.minTime)).toBe(60);
+
+    // The default stays put when the variable is unset, so an existing
+    // deployment is not silently re-TTLed by this change.
+    vi.unstubAllEnvs();
+    vi.resetModules();
+    const dflt = await import("../src/services/sep10");
+    expect(dflt.CHALLENGE_VALIDITY_SECONDS).toBe(300);
+  });
+
+  it("refuses a window longer than the configured lifetime using the same value", async () => {
+    const sep10 = await serviceWithValidity("60");
+    const nowS = Math.floor(Date.now() / 1000);
+
+    // A 300-second envelope is exactly what the default issues, so a deployment
+    // that tightens the TTL must reject it at the bounds check. Generation and
+    // verification read one setting: they can never disagree about the window.
+    expect(() =>
+      sep10.validateChallengeTimeBounds(
+        { minTime: nowS - 1, maxTime: nowS + 300 },
+        new Date(nowS * 1000)
+      )
+    ).toThrow(expect.objectContaining({ code: "CHALLENGE_WINDOW_TOO_LONG", status: 401 }));
+
+    expect(() =>
+      sep10.validateChallengeTimeBounds(
+        { minTime: nowS - 1, maxTime: nowS + 60 },
+        new Date(nowS * 1000)
+      )
+    ).not.toThrow();
   });
 });
 
@@ -279,9 +337,31 @@ describe("SEP-10 redemption through the durable Sep10Challenge row", () => {
     const client = Keypair.random();
     const xdr = signedChallenge(client);
 
-    // A database outage must never become an authentication bypass.
-    await expect(verifyChallenge(xdr)).rejects.toMatchObject(UNAUTHORIZED);
+    // A database outage must never become an authentication bypass — and must
+    // never be reported as one either: the caller's credential is not what
+    // failed here, so a 401 would send them re-signing against a dead store.
+    const reason = await verifyChallenge(xdr).then(
+      () => null,
+      (e: unknown) => e
+    );
+    expect(reason).toBeInstanceOf(AppError);
+    expect(reason).toMatchObject(STORE_UNAVAILABLE);
+    // The driver's text stays in the server log; the client gets fixed wording.
+    expect((reason as AppError).message).not.toContain("connection terminated");
     expect(h.executeRaw).not.toHaveBeenCalled();
+  });
+
+  it("fails closed as a 503 when no durable store is wired at all", async () => {
+    // A deployment that reaches this branch has no `Sep10Challenge` model and
+    // no raw SQL — single use cannot be guaranteed for any request. The
+    // in-process fallback must stay test-only, so the production answer is an
+    // unavailable dependency rather than a silently permissive login.
+    config.isTest = false;
+    const client = Keypair.random();
+
+    await expect(verifyChallenge(signedChallenge(client))).rejects.toMatchObject(
+      STORE_UNAVAILABLE
+    );
   });
 
   it("still enforces single use when the store errors under test", async () => {
@@ -315,7 +395,15 @@ describe("SEP-10 redemption when only raw SQL is available", () => {
     config.isTest = false;
     const client = Keypair.random();
 
-    await expect(verifyChallenge(signedChallenge(client))).rejects.toMatchObject(UNAUTHORIZED);
+    // Fail closed as an unavailable dependency. The pool's own words stay out
+    // of the response.
+    const reason = await verifyChallenge(signedChallenge(client)).then(
+      () => null,
+      (e: unknown) => e
+    );
+    expect(reason).toBeInstanceOf(AppError);
+    expect(reason).toMatchObject(STORE_UNAVAILABLE);
+    expect((reason as AppError).message).not.toContain("too many connections");
   });
 });
 

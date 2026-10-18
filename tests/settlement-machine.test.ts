@@ -207,6 +207,7 @@ describe("applySettlementTransition", () => {
       data: expect.objectContaining({
         action: "settlement.status_changed",
         entityId: "settle_1",
+        groupId: "group_1",
         metadata: expect.objectContaining({
           from: "pending",
           to: "submitted",

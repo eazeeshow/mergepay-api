@@ -6,7 +6,7 @@
  * challenge is built, no XDR is decoded or verified, no user is upserted,
  * and no audit row is written. Valid requests must still succeed.
  */
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import jwt from "jsonwebtoken";
 import { Account, Keypair, MuxedAccount, Transaction } from "@stellar/stellar-sdk";
 
@@ -86,11 +86,25 @@ const realSep10 = await vi.importActual<typeof import("../src/services/sep10")>(
 
 let app: Awaited<ReturnType<typeof buildApp>>;
 
+/**
+ * The domain checks compare against `config.SEP10_HOME_DOMAIN`, which this
+ * environment derives from `API_PUBLIC_URL` as `localhost:4000`. A few cases
+ * below pin it to a real domain so the comparison itself is what is under test,
+ * and every test hands the environment's value back.
+ */
+const REAL_HOME_DOMAIN = config.SEP10_HOME_DOMAIN;
+const IS_TEST = config.isTest;
+
 beforeEach(async () => {
   vi.clearAllMocks();
   h.consumed.clear();
   h.prisma.auditLog.create.mockImplementation(async () => ({}));
   if (!app) app = await buildApp();
+});
+
+afterEach(() => {
+  config.SEP10_HOME_DOMAIN = REAL_HOME_DOMAIN;
+  config.isTest = IS_TEST;
 });
 
 // The auth routes are rate limited per client IP. Each request gets its own
@@ -264,7 +278,12 @@ describe("POST /auth/verify validation", () => {
     expect(claims.exp! - claims.iat!).toBe(config.ACCESS_TOKEN_TTL_SECONDS);
   });
 
-  it("accepts the optional SEP-10 domain fields", async () => {
+  it("accepts a home_domain that names the domain this server issues for", async () => {
+    // The route compares the claim against `config.SEP10_HOME_DOMAIN`, which
+    // the test environment derives from API_PUBLIC_URL as `localhost:4000` —
+    // a value the request schema itself refuses. Pin a real domain so the
+    // matching case is the one under test, not the shape of the default.
+    config.SEP10_HOME_DOMAIN = "anchor.example.com";
     const client = Keypair.random();
     h.prisma.user.upsert.mockResolvedValueOnce({
       id: "user_2",
@@ -279,11 +298,77 @@ describe("POST /auth/verify validation", () => {
       payload: {
         transaction: signedChallenge(client),
         home_domain: "anchor.example.com",
-        client_domain: "wallet.example.com",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().token).toBeTruthy();
+  });
+
+  it("matches home_domain case-insensitively", async () => {
+    config.SEP10_HOME_DOMAIN = "anchor.example.com";
+    const client = Keypair.random();
+    h.prisma.user.upsert.mockResolvedValueOnce({
+      id: "user_3",
+      stellarPublicKey: client.publicKey(),
+      displayName: "Tester",
+      avatarUrl: null,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    const res = await inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload: {
+        transaction: signedChallenge(client),
+        home_domain: "ANCHOR.EXAMPLE.COM",
       },
     });
     expect(res.statusCode).toBe(200);
   });
+
+  it("rejects a foreign home_domain without evaluating the credential", async () => {
+    const client = Keypair.random();
+    const transaction = signedChallenge(client);
+
+    const res = await inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload: { transaction, home_domain: "other-anchor.example.com" },
+    });
+
+    expect(res.statusCode).toBe(400);
+    const body = res.json();
+    expect(body.code ?? body.error?.code).toBe("HOME_DOMAIN_MISMATCH");
+    // The remedy is stated, so a misconfigured wallet integration is fixable
+    // from the response alone instead of looking like a bad signature.
+    expect(body.message ?? body.error?.message).toContain(config.SEP10_HOME_DOMAIN);
+    expect(authenticateChallenge).not.toHaveBeenCalled();
+    // Answered from the request, before the envelope was touched: the challenge
+    // is still unredeemed, so the same signed envelope works once corrected.
+    expect(h.consumed.size).toBe(0);
+  });
+
+  it.each(["client_domain", "clientDomain"])(
+    "rejects %s outright instead of ignoring the claim",
+    async (key) => {
+      const client = Keypair.random();
+      const transaction = signedChallenge(client);
+
+      const res = await inject({
+        method: "POST",
+        url: "/auth/verify",
+        payload: { transaction, [key]: "wallet.example.com" },
+      });
+
+      // This server performs no client-domain verification (src/services/sep10.ts
+      // refuses an envelope carrying that operation), so accepting the field and
+      // dropping it let a client believe it had authenticated one.
+      expect(res.statusCode).toBe(400);
+      const body = res.json();
+      expect(body.code ?? body.error?.code).toBe("CLIENT_DOMAIN_UNSUPPORTED");
+      expect(authenticateChallenge).not.toHaveBeenCalled();
+      expect(h.consumed.size).toBe(0);
+    }
+  );
 
   it.each([
     ["missing transaction", {}, "transaction"],
@@ -332,5 +417,28 @@ describe("POST /auth/verify validation", () => {
     const res = await inject({ method: "POST", url: "/auth/verify" });
     expectValidationError(res);
     expect(authenticateChallenge).not.toHaveBeenCalled();
+  });
+
+  it("reports an unreachable challenge store as 503, not as a rejected credential", async () => {
+    const client = Keypair.random();
+    const transaction = signedChallenge(client);
+    config.isTest = false;
+    h.prisma.$executeRaw.mockRejectedValueOnce(new Error("connection terminated unexpectedly"));
+
+    const res = await inject({
+      method: "POST",
+      url: "/auth/verify",
+      payload: { transaction },
+    });
+
+    // Fails closed — the outage mints no session — but says so truthfully: a
+    // 401 here would send the client re-signing against a dead store and would
+    // hide an incident inside a wave of apparently bad credentials.
+    expect(res.statusCode).toBe(503);
+    const body = res.json();
+    expect(body.code ?? body.error?.code).toBe("SERVICE_UNAVAILABLE");
+    expect(body.message ?? body.error?.message).not.toContain("connection terminated");
+    expect(body.token ?? body.error?.token).toBeUndefined();
+    expect(h.prisma.user.upsert).not.toHaveBeenCalled();
   });
 });

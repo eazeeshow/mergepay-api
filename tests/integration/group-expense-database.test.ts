@@ -113,15 +113,6 @@ async function auditActions(groupId: string, entityType?: string): Promise<strin
   return rows.map((row) => row.action);
 }
 
-async function auditActionsFor(userId: string): Promise<string[]> {
-  const rows = await prisma.auditLog.findMany({
-    where: { userId },
-    orderBy: { createdAt: "asc" },
-    select: { action: true },
-  });
-  return rows.map((row) => row.action);
-}
-
 beforeAll(async () => {
   app = await buildApp();
   [owner, member, outsider] = await Promise.all([
@@ -183,11 +174,11 @@ describe("integration suite on a real Postgres (#646)", () => {
     expect(members.map((m) => m.role)).toEqual(["admin", "member"]);
     expect(members.map((m) => m.userId).sort()).toEqual([owner.id, member.id].sort());
 
-    // These two actions are looked up by actor rather than by group: their rows
-    // are written without a `groupId` (it only appears in `metadata`), so the
-    // group's own audit endpoint cannot see them. #649 covers that attribution.
-    expect(await auditActionsFor(member.id)).toContain("group.join");
-    expect(await auditActionsFor(owner.id)).toContain("group.invite_code_create");
+    // #649 attributed these rows. Read them by group rather than by actor, so
+    // the assertion fails again if the column is ever dropped — an actor-scoped
+    // lookup passes whether or not the group id was stored.
+    expect(await auditActions(groupId)).toContain("group.join");
+    expect(await auditActions(groupId)).toContain("group.invite_code_create");
     expect(await prisma.auditLog.count({ where: { action: "group.join", userId: member.id } })).toBe(1);
   });
 
@@ -416,5 +407,97 @@ describe("integration suite on a real Postgres (#646)", () => {
 
     const outsiderRes = await call("GET", `/groups/${groupId}/expenses`, outsider);
     expect(outsiderRes.statusCode).toBe(403);
+  });
+});
+
+/**
+ * Issue #649 — a group's audit feed has to show every change made to it.
+ *
+ * `listAuditLogs` filters on the `groupId` *column*, so an event that stores
+ * its group only inside `metadata` is written and then never returned. A mocked
+ * `src/db` cannot see that: it records whatever payload it is handed, so the
+ * route tests pass while the feature is broken. These assertions go out through
+ * the HTTP endpoint, which is what an administrator actually reads.
+ */
+describe("group audit feed on a real Postgres (#649)", () => {
+  let feedGroupId: string;
+  let joiner: Actor;
+
+  it("attributes membership and webhook events to the group they changed", async () => {
+    const group = await call("POST", "/groups", owner, { name: "Audit Feed" });
+    expect(group.statusCode).toBe(200);
+    feedGroupId = group.json().group.id;
+
+    const code = await call("POST", `/groups/${feedGroupId}/invite`, owner, {});
+    expect(code.statusCode).toBe(200);
+
+    joiner = await createActor("Audit Joiner");
+    const direct = await call("POST", `/groups/${feedGroupId}/invite`, owner, {
+      publicKey: joiner.publicKey,
+    });
+    expect(direct.statusCode).toBe(201);
+
+    const joined = await call("POST", "/groups/join", joiner, {
+      code: code.json().invite.code,
+    });
+    expect(joined.statusCode).toBe(200);
+
+    const registered = await call("POST", `/groups/${feedGroupId}/webhooks`, owner, {
+      url: "https://example.com/mergepay-hook",
+      events: ["expense.created"],
+    });
+    expect(registered.statusCode).toBe(200);
+    const hookId = registered.json().webhook.id;
+
+    const deregistered = await call(
+      "DELETE",
+      `/groups/${feedGroupId}/webhooks/${hookId}`,
+      owner
+    );
+    expect(deregistered.statusCode).toBe(200);
+
+    const feed = await call("GET", `/groups/${feedGroupId}/audit-logs?limit=100`, owner);
+    expect(feed.statusCode).toBe(200);
+    const actions = (feed.json().events as { action: string }[]).map((e) => e.action);
+
+    for (const action of [
+      "group.create",
+      "group.invite_code_create",
+      "group.invite",
+      "group.join",
+      "webhook.register",
+      "webhook.deregister",
+    ]) {
+      expect(actions).toContain(action);
+    }
+
+    // The webhook is gone; only the audit trail records which endpoint stopped
+    // receiving the group's events.
+    const hookEvent = (feed.json().events as any[]).find(
+      (e) => e.action === "webhook.deregister"
+    );
+    expect(hookEvent.entityType).toBe("webhook");
+    expect(hookEvent.entityId).toBe(hookId);
+  });
+
+  it("attributes a member's own departure", async () => {
+    const left = await call("POST", `/groups/${feedGroupId}/leave`, joiner);
+    expect(left.statusCode).toBe(200);
+    expect(await auditActions(feedGroupId)).toContain("group.leave");
+  });
+
+  it("attributes archiving to the group that was archived", async () => {
+    const archived = await call("POST", `/groups/${feedGroupId}/archive`, owner);
+    expect(archived.statusCode).toBe(200);
+
+    // The feed is still readable afterwards: `requireMembership` refuses an
+    // archived group only to callers who are not members, and the archiving
+    // admin remains one — so the event can be read back from the same endpoint
+    // the archive closed to everyone else.
+    const feed = await call("GET", `/groups/${feedGroupId}/audit-logs?limit=100`, owner);
+    expect(feed.statusCode).toBe(200);
+    const actions = (feed.json().events as { action: string }[]).map((e) => e.action);
+    expect(actions).toContain("group.archive");
+    expect(actions).toContain("group.leave");
   });
 });

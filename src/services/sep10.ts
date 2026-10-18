@@ -29,17 +29,21 @@
  *     is kept until the envelope's own `maxTime` plus the clock-skew
  *     tolerance, so it cannot be swept while the challenge is still usable.
  *
- * Failures are always a 401, but not one uniform message: a challenge that is
- * otherwise well-formed and correctly signed but arrived after its validity
- * window is rejected with the dedicated CHALLENGE_EXPIRED error so a client
- * knows the envelope was good and the only remedy is to request a fresh one;
- * a window that has not yet opened or that outlives the validity this server
- * grants gets the sibling CHALLENGE_NOT_YET_VALID / CHALLENGE_WINDOW_TOO_LONG
- * codes. Signature and domain failures stay the generic UNAUTHORIZED —
- * distinguishing them from expiry would hand an attacker a probe for which
- * failures are structural rather than temporal. The SDK's message, the
- * challenge XDR, and any signature material are never echoed back or logged
- * either way.
+ * A rejected credential is always a 401, but never one uniform message: a
+ * challenge that is otherwise well-formed and correctly signed but arrived
+ * after its validity window is rejected with the dedicated CHALLENGE_EXPIRED
+ * error so a client knows the envelope was good and the only remedy is to
+ * request a fresh one; a window that has not yet opened or that outlives the
+ * validity this server grants gets the sibling CHALLENGE_NOT_YET_VALID /
+ * CHALLENGE_WINDOW_TOO_LONG codes. Signature and domain failures stay the
+ * generic UNAUTHORIZED — distinguishing them from expiry would hand an attacker
+ * a probe for which failures are structural rather than temporal. The one
+ * exception is the challenge store itself: when it cannot be reached the
+ * request fails closed with a 503 SERVICE_UNAVAILABLE (see
+ * `challengeStoreUnavailable`), because an outage that reports itself as a wave
+ * of bad credentials is unactionable for the operator and unrecoverable for the
+ * client. The SDK's message, the challenge XDR, and any signature material are
+ * never echoed back or logged either way.
  *
  * Successful verification returns the client's public key; minting the session
  * token stays in src/routes/auth.ts, whose claims contract is unchanged.
@@ -57,7 +61,7 @@ import {
 import { Prisma } from "@prisma/client";
 import { config } from "../config";
 import { prisma } from "../db";
-import { AppError, Errors } from "../errors";
+import { AppError, ErrorCode, Errors } from "../errors";
 import {
   CLOCK_SKEW_TOLERANCE_SECONDS,
   nowSeconds,
@@ -66,8 +70,17 @@ import {
 } from "../lib/time-bounds";
 import { stellar } from "./stellar";
 
-/** How long a freshly built challenge stays signable. */
-export const CHALLENGE_VALIDITY_SECONDS = 300;
+/**
+ * How long a freshly built challenge stays signable, in seconds.
+ *
+ * One value drives both halves of the flow: `buildChallenge` stamps it into the
+ * envelope's `maxTime`, and `validateChallengeTimeBounds` refuses a window
+ * longer than it. Making it a deployment setting (SEP10_CHALLENGE_VALIDITY_SECONDS,
+ * bounded in src/config.ts) lets an operator trade signing comfort against the
+ * replay window without ever letting the two halves disagree.
+ */
+export const CHALLENGE_VALIDITY_SECONDS =
+  config.SEP10_CHALLENGE_VALIDITY_SECONDS;
 
 /** The exact message the SDK raises when a challenge's own window has closed. */
 const EXPIRED_CHALLENGE_MESSAGE = "The transaction has expired";
@@ -96,6 +109,29 @@ export function serverKeypair(): Keypair {
 
 function invalidChallenge(): never {
   throw Errors.unauthorized("Invalid or expired authentication challenge");
+}
+
+/**
+ * The durable challenge store could not be reached, so single use could not be
+ * guaranteed.
+ *
+ * Deliberately *not* a 401. Verification still fails closed — no session is
+ * minted, and a client cannot log in while the store is down — but the failure
+ * is the server's, not the caller's: a database outage reported as
+ * `UNAUTHORIZED` makes an incident look like a wave of bad credentials to both
+ * the operator (whose dashboards and alert rules key off 4xx/5xx) and the
+ * client (whose only remedy is to sign a fresh challenge that fails the same
+ * way). 503 `SERVICE_UNAVAILABLE` is the code this API already uses for an
+ * unreachable dependency, and the one `/health` reports for the same condition;
+ * it says "retry", which is exactly the truth. No database detail is echoed: the
+ * message is fixed text, and the driver's error stays in the server log.
+ */
+function challengeStoreUnavailable(): never {
+  throw new AppError(
+    503,
+    ErrorCode.SERVICE_UNAVAILABLE,
+    "The authentication store is temporarily unavailable. Please retry shortly."
+  );
 }
 
 /**
@@ -417,7 +453,9 @@ function consumeInProcess(fingerprint: string, expiresAt: Date): ConsumeOutcome 
  * for two verifications to slip through.
  *
  * When no durable store is reachable, verification **fails closed** in
- * production; only under test does it fall back to per-process state.
+ * production — with a 503, because the store being down is the server's
+ * problem, not a rejected credential. Only under test does it fall back to
+ * per-process state.
  */
 async function consumeChallenge(params: {
   fingerprint: string;
@@ -436,8 +474,12 @@ async function consumeChallenge(params: {
       });
       return "claimed";
     } catch (error) {
+      // The unique violation *is* the replay signal, and belongs to the caller.
+      // Anything else — the connection dropped, the table missing, the pool
+      // exhausted — is this server's failure, so it is reported as one rather
+      // than as another rejected credential.
       if (isUniqueViolation(error)) return "replayed";
-      if (!config.isTest) invalidChallenge();
+      if (!config.isTest) challengeStoreUnavailable();
     }
   }
 
@@ -462,27 +504,35 @@ async function consumeChallenge(params: {
 
       return Number(inserted) === 1 ? "claimed" : "replayed";
     } catch (error) {
+      // An AppError raised below this layer already carries its own status and
+      // code, so it is rethrown untouched rather than reclassified.
       if (error instanceof AppError) throw error;
-      if (!config.isTest) invalidChallenge();
+      if (!config.isTest) challengeStoreUnavailable();
     }
   }
 
-  if (!config.isTest) invalidChallenge();
+  // No durable store is wired at all. Under test the documented in-process
+  // store keeps single use honest; in production this is a deployment failure
+  // and must never become an authentication bypass.
+  if (!config.isTest) challengeStoreUnavailable();
   return consumeInProcess(fingerprint, expiresAt);
 }
 
 /**
  * Verify a signed challenge and return the authenticated client public key.
  *
- * Rejects — always with a 401 — challenges that are malformed, expired (code
- * CHALLENGE_EXPIRED), not yet valid (CHALLENGE_NOT_YET_VALID), valid longer
- * than this server issues (CHALLENGE_WINDOW_TOO_LONG), built for the wrong
- * network, home domain, web auth domain, or server account, signed by the
- * wrong client (or not at all), structurally unlike a challenge this server
- * issued, or already redeemed. Signature failures report a distinct message
- * from expiry so a client with a correctly-built but unsigned envelope retries
- * the signature; every other failure stays the generic UNAUTHORIZED with one
- * uniform message, so rejections cannot be probed for which check failed.
+ * A rejected credential is a 401 — never one uniform message: a challenge that
+ * is otherwise well-formed and correctly signed but arrived after its validity
+ * window is rejected with CHALLENGE_EXPIRED, a window that has not yet opened or
+ * that outlives the validity this server grants with CHALLENGE_NOT_YET_VALID /
+ * CHALLENGE_WINDOW_TOO_LONG, and everything else (wrong signature, wrong
+ * network, wrong home or web-auth domain, a structurally unlike envelope, an
+ * already-redeemed challenge) with the generic UNAUTHORIZED. Signature failures
+ * report a distinct message from expiry so a client with a correctly-built but
+ * unsigned envelope retries the signature; every other failure stays uniform, so
+ * rejections cannot be probed for which check failed. The only non-401 is the
+ * durable store being unreachable, which fails closed as a 503 (see
+ * `challengeStoreUnavailable`).
  */
 export async function verifyChallenge(signedXdr: string): Promise<string> {
   return (await authenticateChallenge(signedXdr)).account;

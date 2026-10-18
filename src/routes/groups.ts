@@ -509,10 +509,11 @@ export default async function groupRoutes(app: FastifyInstance) {
 
         await auditTx(tx, {
           userId: auth.id,
+          groupId: id,
           action: "group.invite",
           entityType: "invitation",
           entityId: created.id,
-          metadata: { groupId: id, inviteePublicKey: body.publicKey },
+          metadata: { inviteePublicKey: body.publicKey },
         });
 
         return created;
@@ -541,10 +542,10 @@ export default async function groupRoutes(app: FastifyInstance) {
       });
       await auditTx(tx, {
         userId: auth.id,
+        groupId: id,
         action: "group.invite_code_create",
         entityType: "invite",
         entityId: created.id,
-        metadata: { groupId: id },
       });
       return created;
     });
@@ -598,6 +599,7 @@ export default async function groupRoutes(app: FastifyInstance) {
         });
         await auditTx(tx, {
           userId: auth.id,
+          groupId: invite.groupId,
           action: "group.join",
           entityType: "group",
           entityId: invite.groupId,
@@ -657,6 +659,7 @@ export default async function groupRoutes(app: FastifyInstance) {
       });
       await auditTx(tx, {
         userId: auth.id,
+        groupId: id,
         action: "group.leave",
         entityType: "group",
         entityId: id,
@@ -914,6 +917,7 @@ export default async function groupRoutes(app: FastifyInstance) {
       });
       await auditTx(tx, {
         userId: auth.id,
+        groupId: id,
         action: "group.archive",
         entityType: "group",
         entityId: id,

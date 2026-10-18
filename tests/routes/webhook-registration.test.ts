@@ -7,6 +7,7 @@ const h = vi.hoisted(() => {
       count: vi.fn(async () => 0),
       findMany: vi.fn(async () => []),
       findFirst: vi.fn(async () => null),
+      delete: vi.fn(async ({ where }: any) => ({ id: where.id })),
     },
     webhookDelivery: { createMany: vi.fn(async () => ({ count: 0 })) },
     groupMember: { findUnique: vi.fn() },
@@ -186,5 +187,69 @@ describe("POST /api/webhooks", () => {
     expect(res.statusCode).toBe(400);
     expect(res.json().error.code).toBe("WEBHOOK_LIMIT_REACHED");
     expect(prisma.webhook.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("DELETE /groups/:groupId/webhooks/:webhookId", () => {
+  function deregister(headers = authHeader()) {
+    return app.inject({
+      method: "DELETE",
+      url: `/groups/${GROUP_ID}/webhooks/webhook_1`,
+      headers,
+    });
+  }
+
+  beforeEach(() => {
+    prisma.webhook.findFirst.mockResolvedValue({
+      id: "webhook_1",
+      groupId: GROUP_ID,
+      url: "https://example.test/hook",
+      events: ["settlement.completed"],
+    });
+  });
+
+  it("removes the endpoint and audits the removal against the group", async () => {
+    const res = await deregister();
+
+    expect(res.statusCode).toBe(200);
+    expect(prisma.webhook.delete).toHaveBeenCalledWith({ where: { id: "webhook_1" } });
+    // The row itself is gone, so the audit record is the only place the group's
+    // trail can still say which URL stopped receiving its events.
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "webhook.deregister",
+          userId: USER_ID,
+          groupId: GROUP_ID,
+          entityType: "webhook",
+          entityId: "webhook_1",
+          metadata: expect.objectContaining({ url: "https://example.test/hook" }),
+        }),
+      })
+    );
+  });
+
+  it("refuses a non-admin without deleting or auditing", async () => {
+    prisma.groupMember.findUnique.mockResolvedValue({
+      groupId: GROUP_ID,
+      userId: USER_ID,
+      role: "member",
+    });
+
+    const res = await deregister();
+
+    expect(res.statusCode).toBe(403);
+    expect(prisma.webhook.delete).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("404s for a webhook the group does not own without auditing", async () => {
+    prisma.webhook.findFirst.mockResolvedValue(null);
+
+    const res = await deregister();
+
+    expect(res.statusCode).toBe(404);
+    expect(prisma.webhook.delete).not.toHaveBeenCalled();
+    expect(prisma.auditLog.create).not.toHaveBeenCalled();
   });
 });

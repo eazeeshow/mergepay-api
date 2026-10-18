@@ -308,6 +308,18 @@ describe("membership lifecycle — create, invite, join, leave (#507)", () => {
       where: { id: "invite_1" },
       data: { uses: { increment: 1 } },
     });
+    // The join is audited *for the group*. The invite code is resolved before
+    // the caller has any membership, so nothing else in the request names the
+    // group — the id has to be taken from the invite and stored.
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "group.join",
+          userId: OUTSIDER_ID,
+          groupId: GROUP_ID,
+        }),
+      })
+    );
   });
 
   it("a member can leave, and the leave is audited", async () => {
@@ -323,7 +335,13 @@ describe("membership lifecycle — create, invite, join, leave (#507)", () => {
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ action: "group.leave", userId: MEMBER_ID }),
+        data: expect.objectContaining({
+          action: "group.leave",
+          userId: MEMBER_ID,
+          // The row must carry the group in the column `listAuditLogs` filters
+          // on; a metadata copy leaves the group's own feed empty (#649).
+          groupId: GROUP_ID,
+        }),
       })
     );
   });
@@ -461,7 +479,11 @@ describe("admin authorization — the role boundary (#507)", () => {
     });
     expect(prisma.auditLog.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ action: "group.archive", userId: ADMIN_ID }),
+        data: expect.objectContaining({
+          action: "group.archive",
+          userId: ADMIN_ID,
+          groupId: GROUP_ID,
+        }),
       })
     );
   });
