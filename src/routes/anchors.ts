@@ -1,4 +1,4 @@
-import { FastifyInstance } from "fastify";
+import { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { timingSafeEqual } from "node:crypto";
 import { prisma } from "../db";
@@ -100,7 +100,7 @@ export default async function anchorRoutes(app: FastifyInstance) {
   // -- start deposit / withdraw -----------------------------------------------
   async function start(
     kind: "deposit" | "withdrawal",
-    req: any,
+    req: FastifyRequest,
     requestSchema = kind === "deposit"
       ? sep24DepositRequestSchema
       : sep24WithdrawRequestSchema

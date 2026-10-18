@@ -548,6 +548,7 @@ Status tracking (`src/services/anchor.ts`, `src/services/anchor-status.ts`):
 | GET | `/groups/:id/balances` · `/groups/:id/ledger` | Balances & ledger |
 | POST/GET | `/groups/:id/treasury/*` · `/treasury-transactions/:id/confirm` | Treasury |
 | GET/POST | `/anchors` · `/anchors/deposit` · `/anchors/withdraw` · `/anchors/sessions/:id/complete` · `/anchors/sessions` · `/anchors/webhook` | Anchors |
+| POST/GET | `/withdraw` · `/withdraw/:id` · `/withdraw/:id/confirm` | SEP-24 withdrawals |
 | GET | `/history` | Cross-group history |
 | POST/GET | `/uploads/receipt` · `/uploads/:file` | Receipts |
 | GET | `/health` · `/health/live` · `/health/ready` | Liveness & readiness probes (see [HEALTH.md](HEALTH.md)) |
@@ -781,6 +782,42 @@ own error text is never returned.
 Tests: [`tests/validations/sep10.test.ts`](tests/validations/sep10.test.ts),
 [`tests/sep10-request-validation.test.ts`](tests/sep10-request-validation.test.ts),
 [`tests/sep10-generation-and-redemption.test.ts`](tests/sep10-generation-and-redemption.test.ts).
+
+### SEP-24 withdrawal request validation (#663)
+
+`POST /withdraw`, `POST /withdraw/:id/confirm` and `GET /withdraw/:id` were the
+three SEP-24 withdrawal routes that parsed their input inline and carried no
+`schema` at all, so they were invisible in `/docs`. They now parse against
+shared Zod schemas and document the same contract:
+
+- **Withdrawal body** — `sep24WithdrawalRequestBodySchema`
+  ([`src/validations/sep24.ts`](src/validations/sep24.ts)): a decimal amount
+  with at most 7 fractional places, a 1–12 character alphanumeric asset code,
+  an optional `MP:`-prefixed memo, strict about unknown keys. Positivity and
+  asset *support* stay in the handler, so `INVALID_AMOUNT` and
+  `UNSUPPORTED_ASSET` keep their own answers instead of being swallowed by a
+  generic validation error.
+- **Signed envelope** — `POST /withdraw/:id/confirm` takes the same
+  `signedXdrRequestSchema` as the settlement and treasury confirmations
+  ([`src/validations/stellar-transaction.ts`](src/validations/stellar-transaction.ts)):
+  canonical base64 that the SDK can decode as a transaction envelope. Any other
+  string is a 400 naming `signedXdr` *before* the anchor's auth endpoint is
+  contacted; previously it was forwarded upstream and came back as a 502.
+- **`:id`** — one `sep24WithdrawalParamsSchema` shared by both `:id` routes, so
+  the pair cannot drift apart. Its rule is presence, which is what both routes
+  have always applied.
+- All three are annotated `openApiBody(..., { enforce: false })`, so the Zod
+  parse in the handler stays the only validator and every rejection arrives in
+  the `VALIDATION_ERROR` envelope with `details` and `issues`.
+
+`POST /withdraw/:id/confirm` answers with the withdrawal **flat**
+(`{ id, status, transaction_id, … }`), while initiation and the read route wrap
+the same record under a `withdrawal` key. The annotation documents that as it
+is: reshaping a published response is a client-visible change, not a validation
+one.
+
+Tests: [`tests/withdraw.test.ts`](tests/withdraw.test.ts),
+[`tests/openapi-annotations.test.ts`](tests/openapi-annotations.test.ts).
 
 ## Deployment
 

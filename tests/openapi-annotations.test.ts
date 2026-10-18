@@ -139,3 +139,86 @@ describe("OpenAPI: settlement routes", () => {
     expect(confirm.responses["404"]).toBeTruthy();
   });
 });
+
+describe("OpenAPI: SEP-24 withdrawal routes (#663)", () => {
+  /** Every JSON Schema keyword present in a tree, however deeply nested. */
+  function keywords(node: unknown, found = new Set<string>()): Set<string> {
+    if (Array.isArray(node)) {
+      for (const entry of node) keywords(entry, found);
+      return found;
+    }
+    if (!node || typeof node !== "object") return found;
+    for (const [keyword, value] of Object.entries(node as Record<string, unknown>)) {
+      found.add(keyword);
+      keywords(value, found);
+    }
+    return found;
+  }
+
+  it("documents the withdrawal initiation, confirmation, and read operations", () => {
+    const start = operation("/withdraw", "post");
+    expect(start.tags).toContain("SEP-24");
+    expect(start.summary).toBeTruthy();
+    expect(start.description).toBeTruthy();
+    expect(start.requestBody?.content?.["application/json"]?.schema).toBeTruthy();
+    for (const status of ["200", "400", "401", "429"]) {
+      expect(start.responses[status], `missing ${status} on POST /withdraw`).toBeTruthy();
+    }
+
+    const confirm = operation("/withdraw/{id}/confirm", "post");
+    expect(confirm.tags).toContain("SEP-24");
+    expect(confirm.requestBody?.content?.["application/json"]?.schema).toBeTruthy();
+    for (const status of ["200", "400", "401", "404", "429"]) {
+      expect(confirm.responses[status], `missing ${status} on POST /withdraw/{id}/confirm`).toBeTruthy();
+    }
+
+    const read = operation("/withdraw/{id}", "get");
+    expect(read.tags).toContain("SEP-24");
+    for (const status of ["200", "401", "403", "404"]) {
+      expect(read.responses[status], `missing ${status} on GET /withdraw/{id}`).toBeTruthy();
+    }
+  });
+
+  it("names the id path parameter on both :id withdrawal routes", () => {
+    for (const [path, method] of [
+      ["/withdraw/{id}", "get"],
+      ["/withdraw/{id}/confirm", "post"],
+    ] as const) {
+      const op = operation(path, method);
+      const id = op.parameters?.find((p: any) => p.name === "id");
+      expect(id, `no documented id parameter on ${method.toUpperCase()} ${path}`).toBeTruthy();
+      expect(id.in).toBe("path");
+      expect(id.required).toBe(true);
+    }
+  });
+
+  it("documents the withdrawal payloads without the keywords that would let Fastify reject them", () => {
+    // The handlers own the rules, so ajv must not answer in its own words (or
+    // strip a field) before Zod can name the offending one — the same contract
+    // the interactive SEP-24 routes already keep.
+    for (const [path, method] of [
+      ["/withdraw", "post"],
+      ["/withdraw/{id}/confirm", "post"],
+    ] as const) {
+      const body = operation(path, method).requestBody.content["application/json"].schema;
+      expect(body.additionalProperties).toBe(true);
+      expect(body.required).toEqual([]);
+      const found = keywords(body);
+      for (const rule of ["pattern", "minLength", "maxLength", "format"]) {
+        expect(found.has(rule), `${rule} on ${path} would let Fastify reject before Zod`).toBe(false);
+      }
+    }
+  });
+
+  it("still documents the fields each withdrawal body takes", () => {
+    const start = operation("/withdraw", "post");
+    expect(Object.keys(start.requestBody.content["application/json"].schema.properties)).toEqual(
+      expect.arrayContaining(["amount", "assetCode", "memo"])
+    );
+
+    const confirm = operation("/withdraw/{id}/confirm", "post");
+    expect(
+      Object.keys(confirm.requestBody.content["application/json"].schema.properties)
+    ).toContain("signedXdr");
+  });
+});

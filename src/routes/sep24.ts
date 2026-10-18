@@ -12,7 +12,7 @@
  * two exist side by side because anchors differ in which scheme they support;
  * each verifies its own credential and both converge on session state.
  */
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { config } from "../config";
 import { prisma } from "../db";
 import { Errors } from "../errors";
@@ -133,7 +133,7 @@ export default async function sep24Routes(app: FastifyInstance) {
 
   async function handleStartInteractive(
     kind: "deposit" | "withdrawal",
-    req: any,
+    req: FastifyRequest,
     requestSchema = kind === "deposit"
       ? sep24DepositRequestSchema
       : sep24WithdrawRequestSchema

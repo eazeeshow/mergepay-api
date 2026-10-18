@@ -26,11 +26,15 @@ export {
   sep24MemoSchema,
   sep24MemoTypeSchema,
   sep24StellarTransactionHashSchema,
+  sep24WithdrawalParamsSchema,
+  sep24WithdrawalRequestBodySchema,
   sep24WithdrawRequestSchema,
   type Sep24CallbackQuery,
   type Sep24InitQuery,
   type Sep24InteractiveRequest,
   type Sep24DepositRequest,
+  type Sep24WithdrawalParams,
+  type Sep24WithdrawalRequestBody,
   type Sep24WithdrawRequest,
 } from "../validations/sep24";
 
