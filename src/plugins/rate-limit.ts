@@ -2,7 +2,7 @@
  * Rate limiting — the single registration point for @fastify/rate-limit.
  *
  * The per-route tiers live in `src/lib/rate-limit.ts`; this plugin registers
- * the limiter itself and sets the defaults every tier inherits. Four of those
+ * the limiter itself and sets the defaults every tier inherits. Five of those
  * defaults matter beyond the numbers:
  *
  *  - **Response headers.** A client that cannot see its own budget can only
@@ -23,8 +23,12 @@
  *  - **The counter store.** `RATE_LIMIT_STORE=database` shares counters across
  *    instances via Postgres; it is wired here and nowhere else, so the env var
  *    is a real switch rather than a documented no-op.
+ *  - **The boot-time registration mode.** `rateLimit: "off"` registers nothing,
+ *    which is what lets a test suite whose subject is not the limiter keep using
+ *    one app instance — see `RateLimitRegistration` below and
+ *    `BuildAppOptions.rateLimit` in src/app.ts. Production always enforces.
  */
-import type { FastifyContextConfig, FastifyRequest } from "fastify";
+import type { FastifyContextConfig, FastifyPluginAsync, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 import rateLimit from "@fastify/rate-limit";
 import { config } from "../config";
@@ -116,7 +120,26 @@ export function rateLimitStoreOptions(store: string): RateLimitStoreOptions {
   return {};
 }
 
-export default fp(async function rateLimitPlugin(app) {
+/**
+ * Whether a booted instance enforces throttling.
+ *
+ * `"off"` registers no limiter at all. It exists for a suite whose subject is
+ * not the limiter, because the budgets cannot be dodged from inside a suite:
+ * authenticated buckets key on the user (`globalRateLimitKey`) and per-route
+ * tiers key on the user or the IP, so one `buildApp()` reused across a file
+ * accumulates that actor's requests until the next one is a 429 on a route the
+ * test was never about. Production callers never pass it, and the default is
+ * `"enforced"`, so opting out is always a visible, per-suite decision.
+ */
+export type RateLimitRegistration = "enforced" | "off";
+
+export interface RateLimitPluginOptions {
+  rateLimit: RateLimitRegistration;
+}
+
+const rateLimitPlugin: FastifyPluginAsync<RateLimitPluginOptions> = async (app, opts) => {
+  if (opts.rateLimit === "off") return;
+
   await app.register(rateLimit, {
     global: true,
     max: config.RATE_LIMIT_GLOBAL_MAX,
@@ -137,4 +160,6 @@ export default fp(async function rateLimitPlugin(app) {
     errorResponseBuilder: () =>
       new AppError(429, ErrorCode.RATE_LIMITED, "Too many requests. Please retry later."),
   });
-});
+};
+
+export default fp(rateLimitPlugin);

@@ -78,6 +78,22 @@ Expected: a JSON response with `status` and both dependency checks reporting liv
 Tests must run offline. Mock Prisma (`vi.mock("../src/db")`) and the Stellar
 service (`vi.mock("../src/services/stellar")`). Use `app.inject` for route tests.
 
+Rate limits stay enforced in tests, because the suites that assert them
+(`tests/rate-limit-*.test.ts`, `tests/integration/sep10-auth-rate-limit.test.ts`)
+only mean something against the real wiring. The budgets are small and they key
+on the authenticated *user*, not the client address, so a suite that reuses one
+`buildApp()` across a file cannot dodge them by rotating `remoteAddress`: it will
+eventually spend a tier and fail an unrelated assertion with a 429. A suite whose
+subject is not the limiter may boot without one:
+
+```ts
+const app = await buildApp({ rateLimit: "off" });
+```
+
+Use it for nothing else. Production callers pass no options and keep the default
+(`"enforced"`), and a suite testing throttling, the limit headers or the 429
+envelope must leave the limiter in place.
+
 ## Integration Tests
 
 Integration tests cover the full user journey from SEP-10 authentication through
