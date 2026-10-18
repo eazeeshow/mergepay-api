@@ -15,9 +15,11 @@
  * Design
  * ------
  *   1. `createProposal({ groupId, creatorId, xdr })` parses the caller's
- *      unsigned XDR with `TransactionBuilder.fromXDR`, requires its source
- *      to be the group's configured treasury account, and stores it with a
- *      computed `txHash` that every later signature is bound to.
+ *      unsigned XDR with `parseTreasuryXdr`, then runs it through
+ *      `assertTreasuryEnvelopePolicy` — source account, operation structure,
+ *      fee band and expiry window must all be what a treasury proposal of this
+ *      group could legitimately be — and stores it with a computed `txHash`
+ *      that every later signature is bound to.
  *
  *   2. `submitSignature({ proposalId, signedXdr, ... })` runs inside a
  *      database transaction with a row-level lock on the proposal. It loads
@@ -37,6 +39,11 @@
  * --------------------
  *   - Every signature is bound to the proposal's `txHash`; a submission for
  *     a modified transaction is rejected before any signature is inspected.
+ *   - A caller-supplied envelope is only ever stored or submitted after
+ *     `assertTreasuryEnvelopePolicy` has decoded it and confirmed it spends
+ *     from the group's treasury account, carries a reviewable set of
+ *     operations, stays inside the fee band this API accepts, and holds an
+ *     expiry that has not lapsed.
  *   - Only group admins whose public key is a live, positive-weight signer
  *     on the source account may contribute weight — a valid signature from
  *     a non-admin or removed signer is rejected outright, not silently
@@ -47,17 +54,16 @@
  *     already present on a submitted envelope are read and verified.
  */
 
-import {
-  Keypair,
-  Transaction,
-  TransactionBuilder,
-  FeeBumpTransaction,
-} from "@stellar/stellar-sdk";
+import { Keypair } from "@stellar/stellar-sdk";
 import { Prisma } from "@prisma/client";
 import { config } from "../config";
 import { Errors } from "../errors";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
+import {
+  assertTreasuryEnvelopePolicy,
+  parseTreasuryXdr,
+} from "./treasury-stellar";
 import { auditTx } from "./audit";
 import { AuditAction } from "./audit-actions";
 
@@ -93,26 +99,6 @@ export interface SignatureSubmissionResult {
   stellarTxHash: string | null;
 }
 
-/**
- * Parse an untrusted envelope, rejecting anything that isn't a plain
- * (non-fee-bump) transaction for our configured network.
- */
-function parseXdr(xdr: string, malformedMessage: string): Transaction {
-  let parsed: Transaction | FeeBumpTransaction;
-  try {
-    parsed = TransactionBuilder.fromXDR(xdr, config.networkPassphrase);
-  } catch {
-    throw Errors.badRequest("xdr_malformed", malformedMessage);
-  }
-  if (parsed instanceof FeeBumpTransaction) {
-    throw Errors.badRequest(
-      "xdr_mismatch",
-      "Fee-bump transaction envelopes are not accepted"
-    );
-  }
-  return parsed;
-}
-
 export const treasurySignaturesService = {
   /**
    * Store a new signature-collection proposal from a caller-supplied unsigned XDR.
@@ -125,7 +111,9 @@ export const treasurySignaturesService = {
    *   envelope was parsed against.
    * @throws {AppError} `treasury_disabled` / `treasury_unfunded` if the group
    *   treasury is off or unfunded; `bad_request` for a malformed, fee-bump, signed,
-   *   or source-mismatched XDR.
+   *   or source-mismatched XDR, or one whose operations, fee, or expiry window
+   *   fall outside treasury policy — the last three carry `details.rule` naming
+   *   the rule that rejected the envelope.
    */
   async createProposal(params: CreateTxProposalParams) {
     const group = await prisma.group.findUnique({ where: { id: params.groupId } });
@@ -136,19 +124,21 @@ export const treasurySignaturesService = {
       );
     }
 
-    const tx = parseXdr(params.xdr, "Could not parse transaction XDR");
+    const tx = parseTreasuryXdr(params.xdr, "Could not parse transaction XDR");
     if (tx.signatures.length > 0) {
       throw Errors.badRequest(
         "xdr_not_unsigned",
         "Expected an unsigned transaction envelope"
       );
     }
-    if (tx.source !== group.treasuryAccountPublicKey) {
-      throw Errors.badRequest(
-        "xdr_mismatch",
-        "Transaction source must be the group's treasury account"
-      );
-    }
+    // Source account, operation structure, fee band and expiry window are all
+    // checked before a single row is written: signers approve the exact bytes
+    // they sign, and a proposal is immutable once it has weight behind it, so
+    // an envelope this server would never have built must not become a
+    // proposal at all (issue #666).
+    assertTreasuryEnvelopePolicy(tx, {
+      treasuryAccountPublicKey: group.treasuryAccountPublicKey,
+    });
 
     const account = await stellar.loadAccount(group.treasuryAccountPublicKey);
     if (!account.exists) {
@@ -267,7 +257,7 @@ export const treasurySignaturesService = {
         const actorPublicKey =
           authorizedAdmins.find((admin) => admin.userId === args.userId)?.publicKey ?? null;
 
-        const submitted = parseXdr(args.signedXdr, "Could not parse signed XDR");
+        const submitted = parseTreasuryXdr(args.signedXdr, "Could not parse signed XDR");
         const submittedHash = submitted.hash().toString("hex");
         if (submittedHash !== proposal.txHash) {
           throw Errors.badRequest(
@@ -281,6 +271,15 @@ export const treasurySignaturesService = {
             "Submitted XDR carries no signatures"
           );
         }
+        // The hash check above makes this envelope byte-identical to the
+        // stored proposal, so the only things this re-check can catch are the
+        // two ways a stored envelope goes bad after creation: a window that
+        // has since lapsed, and a proposal accepted before this policy
+        // existed. Both must be refused before any signature weight is
+        // recorded, not by Horizon after the group believes it is settled.
+        assertTreasuryEnvelopePolicy(submitted, {
+          treasuryAccountPublicKey: proposal.sourceAccount,
+        });
 
         const existing = await db.treasurySignature.findMany({
           where: { proposalId: proposal.id },
@@ -418,7 +417,7 @@ export const treasurySignaturesService = {
         // Merge every stored signature onto a fresh copy of the original
         // envelope (never the just-submitted one) so a signature collected
         // on an earlier request can't be dropped or duplicated.
-        const base = parseXdr(proposal.xdr, "Stored proposal envelope is corrupt");
+        const base = parseTreasuryXdr(proposal.xdr, "Stored proposal envelope is corrupt");
         for (const s of allSignatures) {
           try {
             base.addSignature(s.signerPublicKey, s.signature);

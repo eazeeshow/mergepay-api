@@ -10,10 +10,23 @@
  * Every function here is a pure read over `stellar.loadAccount` or a
  * deterministic transformation of an envelope, so it is safe to call from
  * request handlers and cheap to fake.
+ *
+ * Issue #666 added the treasury envelope inspection layer
+ * (`inspectTreasuryXdr` / `assertTreasuryEnvelopePolicy`). The signature
+ * collector accepts an XDR this server never built, so before any signature is
+ * stored — and before a merged envelope reaches Horizon — the envelope is
+ * decoded and checked against the treasury account it claims to spend from:
+ * source account, operation structure, fee band, and time bounds.
  */
+import { StrKey, FeeBumpTransaction, Transaction, TransactionBuilder } from "@stellar/stellar-sdk";
+import { config } from "../config";
 import { AppError, Errors } from "../errors";
+import { validateAmount } from "../lib/money";
 import {
   stellar,
+  assertTimeBoundsValid,
+  MAX_FEE_STROOPS_PER_OP,
+  MIN_FEE_STROOPS_PER_OP,
   type AccountSnapshot,
   type AssetSpec,
   type PaymentExpectation,
@@ -193,4 +206,244 @@ export function assertSignedXdrMatchesIntent(
       "Submitted signed XDR does not match the intended transaction"
     );
   }
+}
+
+/**
+ * Largest operation count a treasury envelope may carry.
+ *
+ * A multisig treasury spends only what its signers have each reviewed, and
+ * every operation adds to the fee the treasury itself pays. An envelope with
+ * hundreds of operations is neither reviewable by a human signer nor a
+ * transaction this API would ever have built, so the collector bounds it
+ * instead of accepting whatever a coordination tool produced.
+ */
+export const MAX_TREASURY_OPERATIONS = 10;
+
+/** The decoded fields the inspection reads. The SDK types these loosely. */
+interface TreasuryOperation {
+  type?: string;
+  source?: string;
+  amount?: string;
+  destination?: string;
+}
+
+/** Operation types whose `amount` must be a positive, well-formed Stroop amount. */
+const POSITIVE_AMOUNT_OPERATIONS = new Set(["payment"]);
+
+/** Operation types whose `destination` names a Stellar account. */
+const ACCOUNT_DESTINATION_OPERATIONS = new Set([
+  "payment",
+  "createAccount",
+  "accountMerge",
+]);
+
+/**
+ * What an externally built treasury envelope must match to be acceptable.
+ *
+ * Only the treasury account is required; the bounds exist so the collector's
+ * own default cannot be quietly widened by a caller that means to.
+ */
+export interface TreasuryEnvelopePolicy {
+  /** The group's configured treasury account — the only legal source. */
+  treasuryAccountPublicKey: string;
+  /** Upper bound on the operation count. Defaults to {@link MAX_TREASURY_OPERATIONS}. */
+  maxOperations?: number;
+  /** Absolute fee ceiling in stroops. Defaults to the per-operation maximum scaled by the operation count. */
+  maxFeeStroops?: number;
+}
+
+/** What an inspected envelope was found to contain. */
+export interface TreasuryEnvelopeInspection {
+  tx: Transaction;
+  /** The envelope's operation types, in order. */
+  operationTypes: string[];
+  /** The fee the envelope commits the treasury to paying, in stroops. */
+  feeStroops: number;
+}
+
+/**
+ * Reject an envelope that disagrees with treasury policy.
+ *
+ * `xdr_mismatch` is the code every existing envelope rejection in this API
+ * already uses (src/services/stellar.ts), so clients keep branching on the one
+ * code they know; `details.rule` says which rule fired, for support and tests,
+ * without inventing a second error vocabulary.
+ */
+function policyRejected(
+  rule: string,
+  message: string,
+  details?: Record<string, unknown>
+): never {
+  throw Errors.badRequest("xdr_mismatch", message, { rule, ...(details ?? {}) });
+}
+
+/**
+ * Decode an untrusted treasury envelope for the configured network.
+ *
+ * Fee-bump wrappers are rejected: a fee-bump envelope is funded by a *different*
+ * source account than the transaction it wraps, so accepting one would mean
+ * collecting treasury signatures over a transaction whose payer the treasury
+ * policy cannot see.
+ *
+ * @param xdr - The base64 envelope, signed or unsigned.
+ * @param malformedMessage - Message used when the envelope cannot be parsed.
+ * @returns The parsed `Transaction`.
+ * @throws {AppError} `bad_request` (`xdr_malformed`) for unparseable input,
+ *   `xdr_mismatch` for a fee-bump envelope.
+ */
+export function parseTreasuryXdr(
+  xdr: string,
+  malformedMessage = "Could not parse transaction XDR"
+): Transaction {
+  let parsed: Transaction | FeeBumpTransaction;
+  try {
+    parsed = TransactionBuilder.fromXDR(xdr, config.networkPassphrase);
+  } catch {
+    throw Errors.badRequest("xdr_malformed", malformedMessage);
+  }
+  if (parsed instanceof FeeBumpTransaction) {
+    return policyRejected(
+      "fee_bump",
+      "Fee-bump transaction envelopes are not accepted"
+    );
+  }
+  return parsed;
+}
+
+/**
+ * Inspect an already-decoded treasury envelope against treasury policy (issue #666).
+ *
+ * Ordered cheapest and most decisive first, so the reported failure is the one
+ * that matters: the account the envelope spends from, then its operation
+ * structure, then the fee it commits that account to paying, then whether the
+ * envelope is still submittable at all. Every rule fires before a signature is
+ * stored or Horizon is contacted, because a treasury proposal that has already
+ * collected signatures cannot be quietly replaced — the signers approved the
+ * bytes they signed.
+ *
+ * @param tx - The parsed envelope.
+ * @param policy - The treasury account it must be sourced from, and the bounds it must stay inside.
+ * @returns `{ tx, operationTypes, feeStroops }` for the caller to reuse.
+ * @throws {AppError} `bad_request` with `details.rule` naming the rule that
+ *   rejected the envelope; `intent_expired` when the envelope's own window has
+ *   already closed (raised by the shared time-bounds check).
+ */
+export function assertTreasuryEnvelopePolicy(
+  tx: Transaction,
+  policy: TreasuryEnvelopePolicy
+): TreasuryEnvelopeInspection {
+  const treasuryAccountPublicKey = policy.treasuryAccountPublicKey;
+
+  if (tx.source !== treasuryAccountPublicKey) {
+    policyRejected(
+      "source_account",
+      "Transaction source must be the group's treasury account"
+    );
+  }
+
+  const operations = tx.operations as TreasuryOperation[];
+  const maxOperations = policy.maxOperations ?? MAX_TREASURY_OPERATIONS;
+  if (operations.length === 0) {
+    policyRejected("operations", "Transaction must carry at least one operation");
+  }
+  if (operations.length > maxOperations) {
+    policyRejected(
+      "operations",
+      `Transaction carries ${operations.length} operations; a treasury proposal may carry at most ${maxOperations}`,
+      { operations: operations.length, maxOperations }
+    );
+  }
+
+  for (const [index, operation] of operations.entries()) {
+    // An operation may only be re-sourced to the treasury itself. A foreign
+    // per-operation source is how a tampered envelope asks the treasury's
+    // signers to authorize a movement that is not the treasury's to approve.
+    if (operation.source && operation.source !== treasuryAccountPublicKey) {
+      policyRejected(
+        "operation_source",
+        `Operation ${index} is sourced from an account other than the group's treasury`,
+        { index, operationSource: operation.source }
+      );
+    }
+
+    const type = operation.type ?? "";
+    if (POSITIVE_AMOUNT_OPERATIONS.has(type)) {
+      const amount = operation.amount ?? "";
+      if (!validateAmount(amount).ok) {
+        policyRejected(
+          "operation_amount",
+          `Operation ${index} does not carry a positive payment amount`,
+          { index, amount }
+        );
+      }
+    }
+    if (ACCOUNT_DESTINATION_OPERATIONS.has(type)) {
+      const destination = operation.destination ?? "";
+      // A muxed (M...) destination is legal here: unlike SEP-10
+      // authentication, a treasury payment may legitimately pay a sub-account.
+      if (
+        !StrKey.isValidEd25519PublicKey(destination) &&
+        !StrKey.isValidMed25519PublicKey(destination)
+      ) {
+        policyRejected(
+          "operation_destination",
+          `Operation ${index} does not name a valid destination account`,
+          { index, destination }
+        );
+      }
+    }
+  }
+
+  // The same band the payment path enforces, scaled by what this envelope
+  // actually does: below the network minimum the transaction can never be
+  // included; above the ceiling the treasury pays away XLM no signer approved.
+  const feeStroops = Number(tx.fee);
+  const minFeeStroops = MIN_FEE_STROOPS_PER_OP * operations.length;
+  const maxFeeStroops =
+    policy.maxFeeStroops ?? MAX_FEE_STROOPS_PER_OP * operations.length;
+  if (!Number.isFinite(feeStroops) || feeStroops < minFeeStroops) {
+    policyRejected(
+      "fee",
+      "Transaction fee is below the network minimum for its operations",
+      { feeStroops, minFeeStroops }
+    );
+  }
+  if (feeStroops > maxFeeStroops) {
+    policyRejected(
+      "fee",
+      "Transaction fee exceeds what this treasury proposal may pay",
+      { feeStroops, maxFeeStroops }
+    );
+  }
+
+  // An envelope with no expiry, or whose expiry has already passed, must never
+  // reach Horizon: it would either sit submittable indefinitely or fail as
+  // tx_too_late after the group believed the transaction was settled. No
+  // intent expiry is supplied because the envelope carries its own window.
+  assertTimeBoundsValid(tx, null, "treasury transaction");
+
+  return {
+    tx,
+    operationTypes: operations.map((operation) => operation.type ?? "unknown"),
+    feeStroops,
+  };
+}
+
+/**
+ * Decode an externally built treasury envelope and inspect it in one step.
+ *
+ * @param xdr - The base64 envelope, typically unsigned when a proposal is created.
+ * @param policy - The treasury account it must be sourced from, and the bounds it must stay inside.
+ * @returns The inspection result, including the parsed transaction.
+ * @throws {AppError} Whatever {@link parseTreasuryXdr} or
+ *   {@link assertTreasuryEnvelopePolicy} raises; see those for the codes.
+ */
+export function inspectTreasuryXdr(
+  xdr: string,
+  policy: TreasuryEnvelopePolicy
+): TreasuryEnvelopeInspection {
+  return assertTreasuryEnvelopePolicy(
+    parseTreasuryXdr(xdr),
+    policy
+  );
 }

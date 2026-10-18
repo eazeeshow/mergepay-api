@@ -718,15 +718,20 @@ export interface PaymentExpectation {
 /**
  * Lower bound for an acceptable fee: the network's own minimum per operation.
  * Below it the transaction cannot be included at all.
+ *
+ * Exported because the treasury signature collector applies the same band to
+ * envelopes it never built itself (see `assertTreasuryEnvelopePolicy` in
+ * src/services/treasury-stellar.ts) and must not invent a second, drifting
+ * copy of the numbers.
  */
-const MIN_FEE_STROOPS_PER_OP = Number(BASE_FEE);
+export const MIN_FEE_STROOPS_PER_OP = Number(BASE_FEE);
 
 /**
  * Upper bound: the fee this API builds into its envelopes. A wallet may return
  * a *cheaper* transaction, but never a more expensive one — an inflated fee is
  * money leaving the user's account beyond what they agreed to.
  */
-const MAX_FEE_STROOPS_PER_OP = Number(BASE_FEE) * 2;
+export const MAX_FEE_STROOPS_PER_OP = Number(BASE_FEE) * 2;
 
 /**
  * Validate a transaction's own validity window.
