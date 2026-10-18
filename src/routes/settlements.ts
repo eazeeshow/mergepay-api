@@ -81,7 +81,11 @@ import {
   evaluatePreflight,
 } from "../services/settlement-preflight";
 
-const settlementInclude = { from: true, to: true, statusHistory: true } as const;
+// `StatusHistory` is a polymorphic table keyed by `(entityType, entityId)` with
+// no foreign key, so Prisma cannot include it from a settlement. Asking for it
+// was a `PrismaClientValidationError` — every route below 500s before this line
+// is reached. Read history with `getStatusHistory()` instead.
+const settlementInclude = { from: true, to: true } as const;
 
 /** Every route in this file takes a single opaque resource id. */
 const idParamSchema = z.object({ id: z.string().min(1).max(64) });

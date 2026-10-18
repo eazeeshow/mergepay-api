@@ -96,6 +96,24 @@ group creation, expense addition, and settlement via the Stellar testnet.
    npm run test:integration
    ```
 
+### Database-backed tests
+
+The database-backed tests (`tests/integration/db/` holds the harness) need a
+Postgres but no running server and no network. `vitest.integration.config.ts`
+registers a global setup/teardown that provisions the schema and empties every
+table once per run, so the suite starts from a known-empty database instead of
+inheriting whatever the last run left:
+
+```bash
+createdb mergepay_test
+DATABASE_URL_TEST="postgresql://postgres@localhost:5432/mergepay_test" npm run test:integration
+```
+
+The schema is applied with `prisma db push` — the same command `npm run
+prisma:deploy` runs — because the committed migration history is not replayable
+onto a fresh database; see issue #646. CI provisions the database as a service
+container in the `integration` job.
+
 ### Integration Test Configuration
 
 The following environment variables can be used to configure integration tests:
