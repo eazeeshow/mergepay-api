@@ -22,6 +22,7 @@ import {
   stellarAmountSchema,
   stellarPublicKeySchema,
 } from "../lib/stellar-validation";
+import { paginationQuerySchema } from "../lib/pagination";
 
 // ─── Callback query-parameter schema ─────────────────────────────────────────
 
@@ -91,6 +92,32 @@ export const sep24TransactionQuerySchema = z
   .strict();
 
 export type Sep24TransactionQuery = z.infer<typeof sep24TransactionQuerySchema>;
+
+/**
+ * Query parameters for SEP-24 transaction *list* polling
+ * (`GET /api/sep24/transactions`).
+ *
+ * The spec's `/transactions` endpoint takes the transfer direction and a page
+ * bound, and nothing else that Mergepay can answer: it has no anchor-side text
+ * search, and its sessions carry no asset filter that a client could not read
+ * from the returned rows. So the schema is the shared pagination contract —
+ * `limit`, `cursor`, `order`, strict about unknown keys exactly as every other
+ * list endpoint — extended with the two SEP-24 parameters this API honours.
+ *
+ * `kind` is an enum rather than a free string because it goes straight into a
+ * database filter: `?kind=depos` is a client bug, and answering it with an
+ * empty list would report "no deposits" instead of "you misspelled the kind".
+ *
+ * `lang` is accepted for parity with the other SEP-24 schemas. It selects the
+ * localisation of an anchor `message`, which Mergepay serves from stored
+ * history, so it is validated and then ignored rather than rejected.
+ */
+export const sep24TransactionsQuerySchema = paginationQuerySchema.extend({
+  kind: z.enum(["deposit", "withdrawal"]).optional(),
+  lang: z.string().min(2).max(10).optional(),
+});
+
+export type Sep24TransactionsQuery = z.infer<typeof sep24TransactionsQuerySchema>;
 
 /** A Stellar transaction hash is a 32-byte value encoded as 64 hex chars. */
 export const sep24StellarTransactionHashSchema = z

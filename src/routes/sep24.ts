@@ -23,6 +23,13 @@ import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
 import { getStatusHistory } from "../services/status-history";
 import { toSep24TransactionView } from "../services/sep24-status";
+import {
+  buildPage,
+  cursorFilter,
+  cursorOrderBy,
+  requireCursor,
+  takeForPage,
+} from "../lib/pagination";
 import { rateLimited } from "../lib/rate-limit";
 import { openApiBody } from "../lib/openapi";
 import {
@@ -35,12 +42,90 @@ import {
   sep24DepositRequestSchema,
   sep24InitQuerySchema,
   sep24TransactionQuerySchema,
+  sep24TransactionsQuerySchema,
   sep24WithdrawRequestSchema,
 } from "../validations/sep24";
 import {
   validateSep24Deposit,
   validateSep24Withdraw,
 } from "../schemas/sep24";
+
+/**
+ * The JSON schema of one SEP-24 transaction object, as rendered by
+ * `toSep24TransactionView`.
+ *
+ * Declared once because two routes answer with it: the single-transaction poll
+ * and the list poll return the *same* shape, and a field added to the view
+ * without being declared here is silently dropped by the serializer. Locking
+ * `additionalProperties` makes that a visible contract change rather than a
+ * response that quietly loses a field on one route and not the other.
+ */
+const sep24TransactionResponse: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["id", "kind", "status", "session_id", "started_at", "status_history"],
+  properties: {
+    id: { type: "string" },
+    kind: { type: "string", enum: ["deposit", "withdrawal"] },
+    status: { type: "string" },
+    session_id: { type: "string" },
+    more_info_url: { type: "string" },
+    started_at: { type: "string" },
+    updated_at: { type: "string" },
+    completed_at: { type: "string" },
+    message: { type: "string" },
+    status_history: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["status", "at", "source", "reason"],
+        additionalProperties: false,
+        properties: {
+          status: { type: "string" },
+          at: { type: "string" },
+          source: { type: ["string", "null"] },
+          reason: { type: ["string", "null"] },
+        },
+      },
+    },
+  },
+};
+
+/**
+ * Read one page of the caller's sessions and render each as a SEP-24
+ * transaction object.
+ *
+ * Shared by both status-poll routes so the list cannot answer a transaction
+ * differently from the single-transaction route it is meant to feed. Each row's
+ * timeline is read per session, concurrently, the same way `GET /groups`
+ * enriches its page — the bound that matters is the page itself (`limit` ≤ 100),
+ * and `getStatusHistory` caps each timeline at 50 rows newest-first.
+ */
+async function toSep24TransactionViews(sessions: readonly Sep24SessionRow[]) {
+  return Promise.all(
+    sessions.map(async (session) =>
+      toSep24TransactionView(
+        session,
+        await getStatusHistory({
+          entityType: "anchor_session",
+          entityId: session.id,
+        })
+      )
+    )
+  );
+}
+
+/** The session columns the status view reads. Structural, so Prisma rows fit. */
+interface Sep24SessionRow {
+  id: string;
+  kind: string;
+  status: string;
+  externalTransactionId: string | null;
+  interactiveUrl: string | null;
+  failureReason: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
 
 export default async function sep24Routes(app: FastifyInstance) {
   const initLimit = rateLimited("anchorInit");
@@ -184,46 +269,7 @@ export default async function sep24Routes(app: FastifyInstance) {
         // with `issues` naming the field.
         querystring: openApiBody(sep24TransactionQuerySchema, { enforce: false }),
         response: {
-          200: {
-            type: "object",
-            // Locked, not open: this is a published spec shape, so a field
-            // added to the view without being declared here is a contract
-            // change that has to be made deliberately.
-            additionalProperties: false,
-            required: [
-              "id",
-              "kind",
-              "status",
-              "session_id",
-              "started_at",
-              "status_history",
-            ],
-            properties: {
-              id: { type: "string" },
-              kind: { type: "string", enum: ["deposit", "withdrawal"] },
-              status: { type: "string" },
-              session_id: { type: "string" },
-              more_info_url: { type: "string" },
-              started_at: { type: "string" },
-              updated_at: { type: "string" },
-              completed_at: { type: "string" },
-              message: { type: "string" },
-              status_history: {
-                type: "array",
-                items: {
-                  type: "object",
-                  required: ["status", "at", "source", "reason"],
-                  additionalProperties: false,
-                  properties: {
-                    status: { type: "string" },
-                    at: { type: "string" },
-                    source: { type: ["string", "null"] },
-                    reason: { type: ["string", "null"] },
-                  },
-                },
-              },
-            },
-          },
+          200: sep24TransactionResponse,
         },
       },
     },
@@ -245,6 +291,99 @@ export default async function sep24Routes(app: FastifyInstance) {
       });
 
       return toSep24TransactionView(session, history);
+    }
+  );
+
+  // SEP-24 transaction list polling (#655).
+  //
+  // `GET /transaction` answers for one transaction; a wallet that has just
+  // reopened needs the caller's whole set to know which of them to poll, and
+  // without a list the only options are the Mergepay-shaped
+  // `GET /anchors/sessions` — which returns sessions, not the SEP-24
+  // transaction object the spec defines — or replaying one id per request.
+  // This route returns the same transaction object as the single poll, in the
+  // spec's `{ transactions: […] }` envelope, over the API's shared cursor
+  // pagination.
+  //
+  // Reads come from the database only, for the reason the single poll documents
+  // above: a client paging through a loop must not be able to amplify its own
+  // polling into anchor traffic.
+  app.get(
+    "/api/sep24/transactions",
+    {
+      preHandler: [app.authenticate],
+      ...pollLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "List SEP-24 transactions for status polling",
+        description:
+          "Returns the caller's SEP-24 transaction objects, newest first, optionally filtered by transfer direction. " +
+          "Accepts the shared pagination parameters — `limit` (1-100, default 50), `cursor`, `order` (asc|desc) — plus SEP-24's `kind` (deposit|withdrawal) and `lang`. Keyset-paginated.",
+        // No `querystring` schema, unlike this file's other routes: ajv runs
+        // with coercion off (src/app.ts), so a documented `limit` of
+        // `type: "integer"` would judge the string `"2"` a query string
+        // actually carries and 400 a valid page request. Every paginated list
+        // in this API — /groups, /anchors/sessions, /history — documents its
+        // parameters in the description and lets Zod own the validation;
+        // this one cannot do otherwise.
+        response: {
+          200: {
+            type: "object",
+            additionalProperties: false,
+            required: ["transactions", "meta"],
+            properties: {
+              transactions: {
+                type: "array",
+                items: sep24TransactionResponse,
+              },
+              meta: {
+                type: "object",
+                required: ["nextCursor", "hasMore", "limit", "order"],
+                additionalProperties: false,
+                properties: {
+                  nextCursor: { type: ["string", "null"] },
+                  hasMore: { type: "boolean" },
+                  limit: { type: "integer" },
+                  order: { type: "string", enum: ["asc", "desc"] },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { cursor, limit, order, kind } = sep24TransactionsQuerySchema.parse(
+        req.query ?? {}
+      );
+      const position = requireCursor(cursor);
+
+      // The `kind` filter is the view's normalisation written as a query, not
+      // the stored column read literally: `toSep24Kind` treats anything other
+      // than "withdrawal" as a deposit, so asking for deposits has to match
+      // every row that is not a withdrawal. Filtering `kind = 'deposit'`
+      // instead would let a row the view renders as a deposit disappear from the
+      // filtered list — a transaction that vanishes between the two routes is
+      // worse than a corrupt value is worth.
+      const sessions = await prisma.anchorSession.findMany({
+        where: {
+          userId: auth.id,
+          ...(kind === undefined
+            ? {}
+            : kind === "withdrawal"
+              ? { kind: "withdrawal" }
+              : { kind: { not: "withdrawal" } }),
+          ...cursorFilter(position, order),
+        },
+        orderBy: cursorOrderBy(order),
+        take: takeForPage(limit),
+      });
+
+      const { items, meta } = buildPage(sessions, limit, order);
+      const transactions = await toSep24TransactionViews(items);
+
+      return { transactions, meta };
     }
   );
   // Rate limiting here is abuse protection for an endpoint that is

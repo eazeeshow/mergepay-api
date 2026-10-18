@@ -78,8 +78,8 @@ name go to the log instead.
 ## Pagination
 
 Applies to `GET /groups`, `/groups/:id/expenses`, `/groups/:id/settlements`, `/groups/:id/ledger`,
-`/groups/:id/treasury/history`, `/anchors/sessions`, and `/history`. Defined in
-[../src/lib/pagination.ts](../src/lib/pagination.ts).
+`/groups/:id/treasury/history`, `/anchors/sessions`, `/api/sep24/transactions`, and `/history`.
+Defined in [../src/lib/pagination.ts](../src/lib/pagination.ts).
 
 ### Query parameters
 
