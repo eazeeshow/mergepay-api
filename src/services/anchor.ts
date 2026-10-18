@@ -42,6 +42,7 @@ import {
 import { fetchWithTimeout, toProviderError } from "./timeout";
 import { anchorCircuit } from "./anchor-circuit";
 import { safeFailureMessage } from "./job-retry";
+import { sanitizeStatusReason } from "./sep24-status";
 import { isSep24TransactionStatus } from "./sep24-types";
 import {
   AnchorError,
@@ -114,6 +115,17 @@ export interface PollResult {
   status: string;
   /** Human-readable message for logging or storing as failureReason. */
   message: string;
+  /**
+   * The anchor's own `message` for this transaction, sanitized, whatever the
+   * status is.
+   *
+   * `message` above is a log breadcrumb that falls back to an internal
+   * "status → status" arrow, so it is not something a client should be shown.
+   * This is the anchor's text — the guidance an anchor sends with
+   * `pending_trust` or `pending_user` — and the reason a status timeline records
+   * for the transition. Undefined when the anchor sent no message.
+   */
+  statusMessage?: string;
   /** True if the poll encountered an error (timeout, network, malformed). */
   isError: boolean;
   /**
@@ -697,6 +709,7 @@ export const anchorService = {
         mappedStatus === "error" && anchorMessage
           ? anchorMessage
           : `SEP-24 status: ${tx.status} → ${mappedStatus}`,
+      statusMessage: sanitizeStatusReason(tx.message),
       isError: false,
       recognized: resolved.recognized,
       transaction: sanitizedTx,

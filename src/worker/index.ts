@@ -1180,7 +1180,11 @@ async function reconcileSingleAnchor(
     source: "poll",
     expectedCurrentStatus: job.status,
     rawStatus: result.rawStatus ?? undefined,
-    reason: result.status === "error" ? result.message : undefined,
+    // For a failure the poll's own message is the whole story; for every other
+    // status the anchor's text is what the user should see, and it was
+    // previously dropped here — leaving the transition's history row with no
+    // reason at all for the polls that advance most sessions.
+    reason: result.status === "error" ? result.message : result.statusMessage,
     extraData: {
       lastPolledAt: now,
       failureReason: result.status === "error" ? result.message ?? null : null,

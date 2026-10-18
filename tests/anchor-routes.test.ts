@@ -14,7 +14,7 @@ const h = vi.hoisted(() => {
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
     auditLog: { create: vi.fn() },
-    statusHistory: { create: vi.fn() },
+    statusHistory: { create: vi.fn(), findMany: vi.fn(async () => []) },
     $transaction: vi.fn(async (fn: any) => fn(prisma)),
     $disconnect: vi.fn(),
   };

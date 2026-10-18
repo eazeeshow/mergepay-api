@@ -484,3 +484,61 @@ describe("getTransaction — bounded retries", () => {
     expect(h.fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+// ─── 7. The anchor's own status message (#651) ───────────────────────────────
+
+/**
+ * `message` is a log breadcrumb with an internal fallback ("SEP-24 status:
+ * pending_trust → pending_trust"), so it is not something a client should be
+ * shown. `statusMessage` is the anchor's text for *any* status, which is what
+ * a status timeline records — the guidance an anchor sends with `pending_trust`
+ * or `pending_user` used to be dropped for every non-error poll result, leaving
+ * the transition with no reason at all.
+ */
+describe("pollTransaction — statusMessage", () => {
+  function poll(over: Record<string, unknown> = {}) {
+    h.fetchMock.mockResolvedValueOnce(json({ transaction: tx(over) }));
+    return anchorService.pollTransaction({
+      transferServer: TRANSFER_SERVER,
+      token: TOKEN,
+      id: "tx_1",
+    });
+  }
+
+  it("carries the anchor's message on an intermediate status", async () => {
+    const result = await poll({
+      status: "pending_trust",
+      message: "Add a trustline to GBUSD to receive your deposit.",
+    });
+
+    expect(result.status).toBe("pending_trust");
+    expect(result.statusMessage).toBe(
+      "Add a trustline to GBUSD to receive your deposit."
+    );
+    // The breadcrumb is unchanged, so existing worker logs keep their format.
+    expect(result.message).toBe("SEP-24 status: pending_trust → pending_trust");
+  });
+
+  it("carries the anchor's message on an error status too", async () => {
+    const result = await poll({
+      status: "error",
+      message: "The sent payment was too small to convert.",
+    });
+
+    expect(result.statusMessage).toBe("The sent payment was too small to convert.");
+    expect(result.message).toBe("The sent payment was too small to convert.");
+  });
+
+  it("is undefined when the anchor sent no message", async () => {
+    const result = await poll({ status: "completed" });
+
+    expect(result.status).toBe("completed");
+    expect(result.statusMessage).toBeUndefined();
+  });
+
+  it("is absent rather than empty for a message that sanitizes to nothing", async () => {
+    const result = await poll({ status: "pending_user", message: "   " });
+
+    expect(result.statusMessage).toBeUndefined();
+  });
+});

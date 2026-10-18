@@ -185,6 +185,9 @@ describe("sensitive routes carry the tighter per-route budget", () => {
     ["GET", "/anchors", "anchorPoll"],
     ["GET", "/anchors/sessions", "anchorPoll"],
     ["GET", "/anchors/sessions/:id", "anchorPoll"],
+    // SEP-24 status polling (#651) — same budget as the session reads, because
+    // it is the same DB-only status read under a spec-shaped response.
+    ["GET", "/api/sep24/transaction", "anchorPoll"],
     ["POST", "/anchors/webhook", "anchorWebhook"],
     ["POST", "/api/sep24/callback", "sep24Callback"],
     ["POST", "/api/webhooks/sep24", "sep24Webhook"],

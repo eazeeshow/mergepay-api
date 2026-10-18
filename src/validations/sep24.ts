@@ -60,6 +60,38 @@ export const sep24InitQuerySchema = z
   })
   .strict();
 
+/**
+ * Query parameters for SEP-24 transaction status polling
+ * (`GET /api/sep24/transaction`).
+ *
+ * `id` is the only locator SEP-24 defines for a single transaction, and it is
+ * required: an unqualified status poll has no answer. It is bounded and
+ * pattern-checked because the value goes straight into a database lookup, and
+ * it may be either Mergepay's own session id or the anchor's transaction id —
+ * both are opaque identifiers of comparable shape, and a client that stored
+ * one from an interactive start must be able to poll with it.
+ *
+ * `lang` is accepted for parity with the callback and initiation schemas; it
+ * selects the localisation of the anchor's `message` and never reaches the
+ * anchor.
+ */
+export const sep24TransactionQuerySchema = z
+  .object({
+    id: z
+      .string()
+      .min(1, "id is required")
+      .max(120, "id is too long")
+      // Anchors mint ids of their own choosing — the reference SRT anchor uses
+      // composite `account:nonce` forms — so the alphabet has to admit `:` and
+      // `.`. What it must not admit is whitespace, `/`, `?` or `&`, which would
+      // mean the caller is describing something other than one opaque id.
+      .regex(/^[A-Za-z0-9_:.-]+$/, "id must be an opaque transaction identifier"),
+    lang: z.string().min(2).max(10).optional(),
+  })
+  .strict();
+
+export type Sep24TransactionQuery = z.infer<typeof sep24TransactionQuerySchema>;
+
 /** A Stellar transaction hash is a 32-byte value encoded as 64 hex chars. */
 export const sep24StellarTransactionHashSchema = z
   .string()

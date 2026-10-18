@@ -231,7 +231,14 @@ export function serializeAnchorSession(s: any): AnchorSession {
     interactiveUrl: s.interactiveUrl ?? null,
     externalTransactionId: s.externalTransactionId ?? null,
     status: s.status,
-    statusHistory: (s.statusHistory ?? []).map(serializeStatusHistory),
+    // Present only when the caller loaded the rows: `status_history` is keyed
+    // by (entityType, entityId) rather than by a Prisma relation, so a plain
+    // session query has no history to show. Emitting `[]` for those reads makes
+    // "this transaction never changed status" — a claim — out of "this route
+    // did not look" — an absence. The field is optional in the contract.
+    ...(s.statusHistory
+      ? { statusHistory: s.statusHistory.map(serializeStatusHistory) }
+      : {}),
     failureReason: s.failureReason ?? null,
     retryCount: s.retryCount ?? 0,
     lastPolledAt: s.lastPolledAt ? iso(s.lastPolledAt) : null,

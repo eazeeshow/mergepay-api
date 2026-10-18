@@ -43,6 +43,7 @@ import { sep24CallbackSchema, type Sep24Callback } from "../schemas/sep24";
 import { audit } from "./audit";
 import { mapAnchorStatus } from "./anchor";
 import { applyAnchorSessionTransition } from "./anchor-status";
+import { sanitizeStatusReason } from "./sep24-status";
 
 /** Header carrying the anchor's HMAC-SHA256 signature over the raw body. */
 export const SEP24_SIGNATURE_HEADER = "x-sep24-signature";
@@ -275,6 +276,7 @@ export async function applySep24Callback(
       nextStatus: status,
       source: "webhook",
       extraData: buildExtraData(callback),
+      reason: sanitizeStatusReason(callback.message),
     });
     if (result.changed) updated += 1;
   }
@@ -304,6 +306,10 @@ export async function applySep24Callback(
  */
 function buildExtraData(callback: Sep24Callback) {
   const extra: Record<string, unknown> = {};
-  if (callback.message) extra.failureReason = callback.message.slice(0, 500);
+  // Sanitized on the way in, not only on the way out: this column is returned
+  // to clients as `failureReason` on the session payload, and an anchor's
+  // message is untrusted text.
+  const reason = sanitizeStatusReason(callback.message);
+  if (reason) extra.failureReason = reason;
   return Object.keys(extra).length > 0 ? extra : undefined;
 }

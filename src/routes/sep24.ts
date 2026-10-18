@@ -15,11 +15,14 @@
 import type { FastifyInstance } from "fastify";
 import { config } from "../config";
 import { prisma } from "../db";
+import { Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { anchorService } from "../services/anchor";
 import { auditTx } from "../services/audit";
 import { serializeAnchorSession } from "../serializers";
 import { validateAsset } from "../services/assets";
+import { getStatusHistory } from "../services/status-history";
+import { toSep24TransactionView } from "../services/sep24-status";
 import { rateLimited } from "../lib/rate-limit";
 import { openApiBody } from "../lib/openapi";
 import {
@@ -31,6 +34,7 @@ import {
   sep24CallbackQuerySchema,
   sep24DepositRequestSchema,
   sep24InitQuerySchema,
+  sep24TransactionQuerySchema,
   sep24WithdrawRequestSchema,
 } from "../validations/sep24";
 import {
@@ -40,6 +44,7 @@ import {
 
 export default async function sep24Routes(app: FastifyInstance) {
   const initLimit = rateLimited("anchorInit");
+  const pollLimit = rateLimited("anchorPoll");
 
   async function handleStartInteractive(
     kind: "deposit" | "withdrawal",
@@ -148,6 +153,99 @@ export default async function sep24Routes(app: FastifyInstance) {
       },
     },
     (req) => handleStartInteractive("withdrawal", req)
+  );
+
+  // SEP-24 status polling (#651).
+  //
+  // The session row is the source of truth, and it is kept current by the
+  // worker's anchor polling (src/worker/index.ts). Answering from the database
+  // rather than by calling the anchor here is deliberate: a client polling this
+  // route in a loop must not be able to amplify one request per user into one
+  // request per poll against the anchor, which is the failure mode the
+  // `anchorInit` budget exists to prevent.
+  //
+  // The response is the SEP-24 transaction object itself, not Mergepay's
+  // session envelope, because this is the endpoint a SEP-24-aware client
+  // expects. Fields the spec marks optional and Mergepay does not track
+  // (`status_eta`, `amount_in`, `fee_details`, …) are omitted rather than
+  // invented; `session_id` and `status_history` are Mergepay's own additions.
+  app.get(
+    "/api/sep24/transaction",
+    {
+      preHandler: [app.authenticate],
+      ...pollLimit,
+      schema: {
+        tags: ["SEP-24"],
+        summary: "Poll SEP-24 transaction status",
+        description:
+          "Returns the SEP-24 transaction object for one deposit or withdrawal, including Mergepay's status timeline.",
+        // Documented but not compiler-enforced: the handler is the only
+        // validator, so a rejection arrives in the VALIDATION_ERROR envelope
+        // with `issues` naming the field.
+        querystring: openApiBody(sep24TransactionQuerySchema, { enforce: false }),
+        response: {
+          200: {
+            type: "object",
+            // Locked, not open: this is a published spec shape, so a field
+            // added to the view without being declared here is a contract
+            // change that has to be made deliberately.
+            additionalProperties: false,
+            required: [
+              "id",
+              "kind",
+              "status",
+              "session_id",
+              "started_at",
+              "status_history",
+            ],
+            properties: {
+              id: { type: "string" },
+              kind: { type: "string", enum: ["deposit", "withdrawal"] },
+              status: { type: "string" },
+              session_id: { type: "string" },
+              more_info_url: { type: "string" },
+              started_at: { type: "string" },
+              updated_at: { type: "string" },
+              completed_at: { type: "string" },
+              message: { type: "string" },
+              status_history: {
+                type: "array",
+                items: {
+                  type: "object",
+                  required: ["status", "at", "source", "reason"],
+                  additionalProperties: false,
+                  properties: {
+                    status: { type: "string" },
+                    at: { type: "string" },
+                    source: { type: ["string", "null"] },
+                    reason: { type: ["string", "null"] },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (req) => {
+      const auth = requireUser(req);
+      const { id } = sep24TransactionQuerySchema.parse(req.query ?? {});
+
+      // Scoped to the caller, so another user's transaction is a 404 rather
+      // than a 403: a status poll must not confirm that an id exists
+      // somewhere else in the system.
+      const session = await prisma.anchorSession.findFirst({
+        where: { userId: auth.id, OR: [{ id }, { externalTransactionId: id }] },
+      });
+      if (!session) throw Errors.notFound("Transaction not found");
+
+      const history = await getStatusHistory({
+        entityType: "anchor_session",
+        entityId: session.id,
+      });
+
+      return toSep24TransactionView(session, history);
+    }
   );
   // Rate limiting here is abuse protection for an endpoint that is
   // unauthenticated until the token is checked. It never substitutes for that
